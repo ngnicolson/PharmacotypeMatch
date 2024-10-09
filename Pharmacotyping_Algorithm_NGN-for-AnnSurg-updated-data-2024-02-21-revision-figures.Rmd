@@ -1,0 +1,1153 @@
+---
+title: "Pharmacotyping_Outcomes_Manuscript_NGN"
+author: "Norman Nicolson"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 12)
+```
+
+```{r load-packages, message=FALSE }
+
+library(ComplexHeatmap)
+library(ggplot2)
+library(survminer)
+library(survival)
+library(corrgram)
+library(tidyverse)
+library(DescTools)
+library(viridis)
+
+
+```
+
+Build dummy/simulated pharmacotyping grid with all levels; chemo agents in columns 1:n-1, last column "case.ID".
+
+This is the format the later regimenMatch algorithm expects, either from sim grid or actual pharmacotype data
+
+```{r sim-grid}
+###################### sim grid maker
+buildSimGrid<- function(sensitivityLevels, drugList){
+pharmacotypingGenericGrid <- data.frame(case.ID = 1:(length(sensitivityLevels))^(length(drugList)))
+for (i in 1:length(drugList)){
+  pharmacotypingGenericGrid[,1+i] <- factor(rep(rep(sensitivityLevels, each = (length(sensitivityLevels))^(length(drugList)-i)) , times = (length(sensitivityLevels))^(i-1)),
+                                          levels = rev(sensitivityLevels))
+}
+colnames(pharmacotypingGenericGrid)<-c("case.ID", drugList)
+pharmacotypingGenericGrid<-pharmacotypingGenericGrid[,c(drugList, "case.ID")]
+pharmacotypingGenericGrid
+}
+
+########
+## run buildSimGrid for pharmacotype grid as constructed in our group
+pharmacotypedCasesSim<- buildSimGrid(sensitivityLevels = c("Sensitive", "Intermediate", "Resistant"), drugList = c("FU", "SN38", "OX",  "GEM","PAC"))
+
+```
+
+
+The pharmacotyping algorithm regimenMatch takes as input a data frame of cases (rows) by drugs (cols), or Sim grid generated above, with discrete levels of sensitivity. Each row also must end with case.ID. 
+
+Builds all possible permutations of provided drugs in the PT panel, and key of which drugs are in which regimens. Option (recommended) to include tiers of combinations if not all are allowed: ranked preferred and/or prohibited regimens. If no list is provided will use all possible combinations of drugs which may not be realistic in some settings. 
+
+Matches cases to regimens by minimizing Manhattan distance metric from idealized case for each regimen to actual pharmacotyped cases, breaking ties by rankings provided (otherwise will tend to prefer more-drug regimen over monotherapy or fewer-drugs if no rankings provided). 
+
+Returns list of summary table of matches at [[1]], original pharmacotype grid annotated with matches at [[2]], all possible drug combinations at [[3]], heatmap object at [[4]]. To print heatmap to visualize pharmacotyping results, call [[4]] or [["heatmapFigure"]]
+
+```{r regimen-match-algorithm}
+
+regimenMatch<- function(pharmacotypedCases, preferredRegimens = NULL, prohibitedRegimens = NULL, sensitivityLevels = c("Sensitive", "Intermediate", "Resistant"), usePermutedCombos = TRUE){
+
+#get list of agents from provided grid  
+chemoAgentsList <- colnames(pharmacotypedCases[,1:(ncol(pharmacotypedCases)-1)])
+
+#compute all possible combinations of agents
+chemoCombinations <- chemoAgentsList
+for (i in 2:length(chemoAgentsList)) {
+chemoCombo <- combn(chemoAgentsList, i)
+chemoCombinations <- c(chemoCombinations, apply(chemoCombo, 2, paste0, collapse = "-"))
+}
+
+allRegimens <- chemoCombinations
+rm(chemoCombo, chemoCombinations, i)
+
+## get list of computed regimens that aren't in provided prohibited list or preferred list
+## note will favor multi-agent over single-agent by default, including higher-multi-agent regimens
+leftoverRegimens <- rev(allRegimens[!allRegimens %in% c(preferredRegimens, prohibitedRegimens) ])
+if (!usePermutedCombos) {leftoverRegimens = NULL}
+
+allRegimensPrioritized <- unique(c(preferredRegimens, leftoverRegimens, "Pan-resistant"))
+
+#build key of which drugs are in which combos, including null/pan-resistant "combo"
+chemoCombinationsKey <- data.frame(combo = allRegimensPrioritized)
+for (i in 1:length(chemoAgentsList)){
+chemoCombinationsKey[,1+i] <- ifelse(grepl(chemoAgentsList[[i]], chemoCombinationsKey$combo), 1 , 0)
+}
+#set row and column names, drop "combo" column once it's used to set rownames
+colnames(chemoCombinationsKey) <- c("combo", chemoAgentsList)
+rownames(chemoCombinationsKey) <- chemoCombinationsKey$combo
+chemoCombinationsKey <- chemoCombinationsKey[,chemoAgentsList]
+#put all zeros for pan resistant
+chemoCombinationsKey["Pan-resistant",] <- rep(0, ncol(chemoCombinationsKey))
+
+
+#make new empty column of matches per each case in pharmacotyping grid
+pharmacotypedCases$matchedRegimen<-NA
+
+## below nested for loops cycle through pharmacotype grid to match each pharmacotype to its nearest regimen, testing regimens in ranked order provided
+
+## for each row of pharmacotype grid
+for (i in 1:nrow(pharmacotypedCases)){
+  
+  # gradually expand allowable distance for match calls 
+  #   (note starts at 1 not 0 which gives slight advantage to ranked list over pure distance)
+  for (h in 1:10){ 
+    
+    # if already found a regimen match for this case, go start next case
+    if (!is.na(pharmacotypedCases[i,"matchedRegimen"])){break}
+    
+    #check current case against each regimen (in priority order)
+    for (j in 1:nrow(chemoCombinationsKey)){ 
+      #compute distance from current regimen's ideal position to current pharmacotyped case
+      ijDistance <- 
+        dist(rbind(
+          as.numeric(pharmacotypedCases[i, chemoAgentsList])-1, 
+          as.numeric(chemoCombinationsKey[j, ])*(length(sensitivityLevels)-1)), 
+          method = "manhattan") 
+        
+      #if we match, write name of regimen and stop checking more regimens
+        if (ijDistance <= h) {
+            pharmacotypedCases[i,"matchedRegimen"]<-rownames(chemoCombinationsKey)[[j]] 
+            break
+        }
+      #repeat against each regimen until something matches at this radius, if not expand radius and try again
+    }
+  }
+  #repeat for each case until grid completed - complete grid becomes [[2]]
+}
+
+
+#evaluate quality of matches from algorithm in same fashion as adjuvant/neoadjuvant
+
+#count how many drugs in matched regimen
+pharmacotypedCases$countOfMatchedDrugs <- 1+ nchar(pharmacotypedCases$matchedRegimen) - nchar(gsub("-","", pharmacotypedCases$matchedRegimen, fixed=TRUE ) )
+
+
+#compute distance between regimen they got and their organoid pharmacotype
+pharmacotypedCases$distanceToMatchedRegimen <- NA
+for (j in 1:length(rownames(pharmacotypedCases))){
+  if (pharmacotypedCases[j, "matchedRegimen"] %in% "Pan-resistant") next
+  keyForRegimenTheyMatched <- c(
+    grepl("FU", pharmacotypedCases[j,"matchedRegimen"], fixed = TRUE),
+    grepl("SN38", pharmacotypedCases[j,"matchedRegimen"], fixed = TRUE),
+    grepl("OX", pharmacotypedCases[j,"matchedRegimen"], fixed = TRUE),
+    grepl("GEM", pharmacotypedCases[j,"matchedRegimen"], fixed = TRUE),
+    grepl("PAC", pharmacotypedCases[j,"matchedRegimen"], fixed = TRUE)
+    )
+  
+  
+  pharmacotype <- pharmacotypedCases[j,c("FU", "SN38", "OX", "GEM", "PAC")]
+  
+  #this will zero out the distance for anything not in the regimen, so we only compare within the space of what they actually matched with, in contrast to the matching algorithm above where we compare everything in 5D every time to compute match
+  pharmacotypedCases[j,"distanceToMatchedRegimen"] <- 
+        as.numeric(dist(rbind(
+          as.numeric(pharmacotype[keyForRegimenTheyMatched])-1, 
+          as.numeric(c(2,2,2,2,2)[keyForRegimenTheyMatched])), 
+          method = "manhattan"))
+}
+
+
+#cutoff of Well-matched to Poorly-matched - distance should be better than distance of "intermediate to everything" pharmacotype would be for that regimen
+pharmacotypedCases$matchedWellMatched <- ifelse(pharmacotypedCases$distanceToMatchedRegimen < pharmacotypedCases$countOfMatchedDrugs, "Well-matched", "Poorly-matched")
+pharmacotypedCases[pharmacotypedCases$matchedRegimen %in% "Pan-resistant",]$matchedWellMatched <- NA
+
+
+rm(keyForRegimenTheyMatched, pharmacotype)
+pharmacotypedCases$distanceToMatchedRegimen <- NULL
+pharmacotypedCases$countOfMatchedDrugs <- NULL
+
+
+#make table of match results into data frame and sort by frequency - this will become [[1]]
+matches<-as.data.frame(table(pharmacotypedCases$matchedRegimen, useNA = "ifany" ))
+colnames(matches)<-c("matchedRegimen","frequency")
+matches <- matches[order(matches$frequency, decreasing=TRUE),]
+
+#prepare parameters for heatmap visualization, starting with sort by frequency of match
+matches$frequencyRank<-1:length(matches$frequency)
+rowOrderMatrix<-merge(pharmacotypedCases[,c("case.ID", "matchedRegimen")], matches[,c("frequencyRank","matchedRegimen")], by =  "matchedRegimen", all = TRUE, sort = FALSE)
+rowOrderMatrix<-rowOrderMatrix[sort.list(rowOrderMatrix$frequencyRank),]
+
+## red/green colorblind non-accessible version
+# colorSpaceSensitivity <- t(as.matrix(colorRampPalette(colors = c("green4", "gold1","red3"))(length(sensitivityLevels))))
+# colorSpaceSensitivity<-as.vector(colorSpaceSensitivity)
+# colorSpaceSensitivity<-setNames(colorSpaceSensitivity, sensitivityLevels)
+
+
+## viridis colorblind friendly version
+colorSpaceSensitivity <-  viridis(length(sensitivityLevels), option = "E")
+colorSpaceSensitivity<-as.vector(colorSpaceSensitivity)
+colorSpaceSensitivity<-setNames(colorSpaceSensitivity, sensitivityLevels)
+
+
+#color palette for left heatmap annotation without quality flag
+colorSpaceMatches <- t(as.matrix(colorRampPalette(colors = c("blue4", "magenta3"))(length(matches$matchedRegimen))))
+colorSpaceMatches<-as.vector(colorSpaceMatches)
+colorSpaceMatches<-setNames(colorSpaceMatches, matches$matchedRegimen)
+
+#heatmap annotations - uses anno_mark to draw lines to labels, and labels first row in each chunk
+# this version without quality flag annotation
+left_HA <- HeatmapAnnotation(which = "row", show_legend = FALSE,
+                             marks = anno_mark(at = which(!duplicated(pharmacotypedCases[,"matchedRegimen"])),
+                                               side = "left",
+                                               labels  =                            pharmacotypedCases[which(!duplicated(pharmacotypedCases[,"matchedRegimen"])),"matchedRegimen"]),
+                             Match = pharmacotypedCases[,"matchedRegimen"],
+                             col = list(Match = colorSpaceMatches)
+                             )
+
+heatmapResult <- Heatmap(as.matrix(pharmacotypedCases[,1:5]), name='Agent Sensitivity',
+        col = colorSpaceSensitivity,
+        left_annotation = left_HA,
+        row_split = factor(pharmacotypedCases$matchedRegimen, levels = matches$matchedRegimen),
+        row_order = order(rowOrderMatrix$frequencyRank),
+        cluster_row_slices = FALSE,
+        cluster_rows = FALSE ,
+        cluster_columns = FALSE,
+        show_column_names = TRUE,
+        column_names_rot = 0,
+        column_names_centered = TRUE,
+        show_row_names = FALSE,
+        row_title = NULL,
+        heatmap_width = unit(12, "cm")
+)
+
+#color palette for left annotations with quality flag
+colorSpaceMatches <- t(as.matrix(colorRampPalette(colors = c("blue4", "magenta3"))(2)))
+colorSpaceMatches<-as.vector(colorSpaceMatches)
+colorSpaceMatches<-setNames(colorSpaceMatches, c("Well-matched", "Poorly-matched"))
+
+#heatmap annotation
+# this version includes quality flag annotation
+left_HA <- HeatmapAnnotation(which = "row", show_legend = FALSE,
+                             marks = anno_mark(at = which(!duplicated(pharmacotypedCases[,"matchedRegimen"])),
+                                               side = "left",
+                                               labels  =                            pharmacotypedCases[which(!duplicated(pharmacotypedCases[,"matchedRegimen"])),"matchedRegimen"]),
+                             MatchQuality = pharmacotypedCases[,"matchedWellMatched"],
+                             col = list(MatchQuality = colorSpaceMatches)
+                             )
+
+heatmapResultWithQualityFlag <- Heatmap(as.matrix(pharmacotypedCases[,1:5]), name='Agent Sensitivity',
+        col = colorSpaceSensitivity,
+        left_annotation = left_HA,
+        row_split = factor(pharmacotypedCases$matchedRegimen, levels = matches$matchedRegimen),
+        row_order = order(rowOrderMatrix$frequencyRank),
+        cluster_row_slices = FALSE,
+        cluster_rows = FALSE ,
+        cluster_columns = FALSE,
+        show_column_names = TRUE,
+        column_names_rot = 0,
+        column_names_centered = TRUE,
+        show_row_names = FALSE,
+        row_title = NULL,
+        heatmap_width = unit(12, "cm")
+)
+
+
+# algorithm will not print heatmaps until result is called directly
+# now gives two options, one with flag for match quality
+
+list(matchFrequencies = matches, matchedCases = pharmacotypedCases, allPossibleCombinations = allRegimens, heatmapFigure = heatmapResult, heatmapFigureWithQualityFlag = heatmapResultWithQualityFlag)
+
+}
+
+```
+
+```{r run-match-algorithm}
+# ranked vector of NCCN-recommended regimens in PDAC
+# note assumes clinical regimen of gem-cis or gem-cis-abraxane could be represented by oxali in lieu of cis
+## ?can oxali sub for cis in our PT?
+NCCNRegimens <- c("FU-SN38-OX", "GEM-PAC", "FU-GEM", "FU-OX", "FU-SN38", "OX-GEM-PAC", "OX-GEM", "FU", "GEM" )
+
+## vector of non-standard-in-pdac but allowed regimens - from NCCN guidelines for cholangio, gastric, colon:
+#"FLOT" FU-OX-PAC, "paclitaxel-carboplatin" in gastric cancer could be OX-PAC, irinotecan or paclitaxel monotherapy options for gastric
+alternateRegimens <- c("FU-OX-PAC", "OX-PAC", "SN38-OX", "SN38-PAC", "SN38", "PAC")
+
+
+SimPharmacotypeMatchResults <- regimenMatch(pharmacotypedCases = pharmacotypedCasesSim, preferredRegimens = c(NCCNRegimens, alternateRegimens), prohibitedRegimens = c("FU-SN38-OX-GEM", "FU-SN38-OX-PAC", "FU-SN38-GEM-PAC", "FU-OX-GEM-PAC", "SN38-OX-GEM-PAC", "FU-SN38-OX-GEM-PAC"), usePermutedCombos = FALSE)
+
+Fig2A <- SimPharmacotypeMatchResults$heatmapFigure
+
+```
+
+```{r load-and-intake-clinical-and-PT-data}
+
+##setWD
+patientData<-read.csv("Clinical-Annotations-For-PT-Cohort-2024-02-21.csv")
+actualPTdata<-read.csv("IC50-values-deduplicated-2024-01-26.csv")
+actualPTdata<-actualPTdata[,c("IC50_5FU", "IC50_SN38", "IC50_Oxa",  "IC50_Gem",  "IC50_Pac", "Line_Name")]
+colnames(actualPTdata) <- c("IC50.FU", "IC50.SN38", "IC50.OX",  "IC50.GEM",  "IC50.PAC", "PDO.line.name")
+
+patientDataMerged <- merge(actualPTdata, patientData, by = "PDO.line.name")
+rm(actualPTdata, patientData)
+
+
+## filter out non-PDAC, non-primary tumor, or no clinical info cases
+patientDataMerged <- patientDataMerged[patientDataMerged$Is.PDAC,]
+patientDataMerged <- patientDataMerged[patientDataMerged$Is.primary.tumor,]
+patientDataMerged <-patientDataMerged[!patientDataMerged$PDO.line.name %in% "SU2C_033",]
+
+
+##reformat dates
+patientDataMerged$Surgery.Date <- as.Date(patientDataMerged$Surgery.Date, format = "%m/%d/%Y")
+patientDataMerged$Recurrence.Date <- as.Date(patientDataMerged$Recurrence.Date, format = "%m/%d/%Y")
+patientDataMerged$Last.Follow.Up.Date <- as.Date(patientDataMerged$Last.Follow.Up.Date , format = "%m/%d/%Y")
+patientDataMerged$Death.Date <- as.Date(patientDataMerged$Death.Date , format = "%m/%d/%Y")
+patientDataMerged$Initial.Dx.Date <- as.Date(patientDataMerged$Initial.Dx.Date , format = "%m/%d/%Y")
+
+##compute survival endpoints and times
+patientDataMerged$RFS.time<-ifelse(!is.na(patientDataMerged$Recurrence.Date),
+                                   patientDataMerged$Recurrence.Date - 
+                                     patientDataMerged$Surgery.Date,
+                                   patientDataMerged$Last.Follow.Up.Date - 
+                                     patientDataMerged$Surgery.Date)
+
+patientDataMerged$RFS.endpoint<-ifelse(!is.na(patientDataMerged$Recurrence.Date),
+                                   1, 0)
+patientDataMerged[patientDataMerged$Surgery %in% c("", "Exploratory_only", "Exploratory only", "None"),]$RFS.endpoint <- NA
+
+
+patientDataMerged$OS.postop.time<-ifelse(!is.na(patientDataMerged$Death.Date),
+                                   patientDataMerged$Death.Date - 
+                                     patientDataMerged$Surgery.Date,
+                                   patientDataMerged$Last.Follow.Up.Date - 
+                                     patientDataMerged$Surgery.Date)
+patientDataMerged$OS.postop.endpoint <- ifelse(!is.na(patientDataMerged$Death.Date),
+                                   1, 0)
+patientDataMerged[patientDataMerged$Surgery %in% c("", "Exploratory_only", "Exploratory only", "None"),]$OS.postop.endpoint <- NA
+
+
+patientDataMerged$OS.overall.time<-ifelse(!is.na(patientDataMerged$Death.Date),
+                                   patientDataMerged$Death.Date - 
+                                     patientDataMerged$Initial.Dx.Date,
+                                   patientDataMerged$Last.Follow.Up.Date - 
+                                     patientDataMerged$Initial.Dx.Date)
+patientDataMerged$OS.overall.endpoint<-ifelse(!is.na(patientDataMerged$Death.Date),
+                                   1, 0)
+
+
+#write csv with no dates to send to Joe
+#dropDates <- colnames(patientDataMerged)
+#dropDates <- dropDates[!grepl("Date",dropDates,fixed = TRUE)]
+#write.csv(patientDataMerged[,dropDates], file = "PDAC-PDO-PT-dataset.csv")
+#patientDataMerged <- read.csv("PDAC-PDO-PT-dataset-datesout-2024-02-05.csv")
+
+#CA19-9 response calculations
+patientDataMerged$CA19.9.prior.to.surgery.if.neoadjuvant <- as.numeric(patientDataMerged$CA19.9.prior.to.surgery.if.neoadjuvant)
+
+
+patientDataMerged$CA19.9.at.diagnosis.or.randomization <- as.numeric(patientDataMerged$CA19.9.at.diagnosis.or.randomization)
+
+
+patientDataMerged$relativeDeltaCA199 <- (patientDataMerged$CA19.9.prior.to.surgery.if.neoadjuvant - patientDataMerged$CA19.9.at.diagnosis.or.randomization)/(patientDataMerged$CA19.9.at.diagnosis.or.randomization)
+
+patientDataMerged$relativeDeltaCA199IfEverAbnormal <- ifelse(patientDataMerged$CA19.9.at.diagnosis.or.randomization >= 35 | patientDataMerged$CA19.9.prior.to.surgery.if.neoadjuvant >= 35, patientDataMerged$relativeDeltaCA199, NA)
+
+patientDataMerged$dichotomizedDeltaCA199byDidItNormalize<-ifelse(is.na(patientDataMerged$relativeDeltaCA199IfEverAbnormal), NA, ifelse(as.numeric(patientDataMerged$CA19.9.prior.to.surgery.if.neoadjuvant) <= 35, "Became normal after neoadjuvant", "Remained or became elevated during neoadjuvant"))
+
+
+
+#imaging response calculations
+patientDataMerged$imagingResponseRelative<- (as.numeric(patientDataMerged$Tumor.diameter.after.neoadjuvant.tx.mm)- as.numeric(patientDataMerged$Tumor.diameter.at.diagnosis.mm)) / as.numeric(patientDataMerged$Tumor.diameter.at.diagnosis.mm)
+
+patientDataMerged$imagingResponseRECIST <- ifelse(is.na(patientDataMerged$imagingResponseRelative), NA, ifelse(patientDataMerged$imagingResponseRelative <= -0.3, "RECIST response", "No response by RECIST"))
+
+
+##pN category recode
+patientDataMerged$pN.status <- ifelse(patientDataMerged$Lymph.Nodes.positive>0, "N+", "N0")
+
+
+##compute what drugs patients actually got in adjuvant and neoadjuvant settings based on text in "Adjuvant" or "Neoadjuvant" columns
+## should double check this code if additional regimens are listed later
+
+table(patientDataMerged$NeoAdjuvant, useNA="ifany")
+
+#adjuvant
+patientDataMerged$adjuvantFU<-ifelse(
+  grepl("FU", patientDataMerged$Adjuvant, fixed = TRUE) | 
+  grepl("Cap", patientDataMerged$Adjuvant, fixed = TRUE) |
+  grepl("FFX", patientDataMerged$Adjuvant, fixed = TRUE), TRUE, FALSE)
+
+patientDataMerged$adjuvantSN38<-ifelse(grepl("Irinotecan", patientDataMerged$Adjuvant, fixed = TRUE) | 
+                                 grepl("FFX", patientDataMerged$Adjuvant, fixed = TRUE), TRUE, FALSE)
+
+patientDataMerged$adjuvantOX<-ifelse(grepl("platin", patientDataMerged$Adjuvant, fixed = TRUE) |
+                                       grepl("Cis", patientDataMerged$Adjuvant, fixed = TRUE) |
+                                 grepl("FFX", patientDataMerged$Adjuvant, fixed = TRUE), TRUE, FALSE)
+
+patientDataMerged$adjuvantGEM<-ifelse(grepl("GA", patientDataMerged$Adjuvant, fixed = TRUE) | 
+                                 grepl("Gem", patientDataMerged$Adjuvant, fixed = TRUE), TRUE, FALSE)
+
+patientDataMerged$adjuvantPAC<-ifelse(grepl("GA", patientDataMerged$Adjuvant, fixed = TRUE) | 
+                                 grepl("Abraxane", patientDataMerged$Adjuvant, fixed = TRUE), TRUE, FALSE)
+
+
+
+#neoadjuvant
+patientDataMerged$neoAdjuvantFU<-ifelse(
+  grepl("FU", patientDataMerged$NeoAdjuvant, fixed = TRUE) |
+  grepl("Cap", patientDataMerged$Adjuvant, fixed = TRUE) |                     grepl("FFX", patientDataMerged$NeoAdjuvant, fixed = TRUE), TRUE, FALSE)
+
+#note did not check for cape neoadjuvant as this mistakenly picks up chemoradiotherapy case(s) as getting real capecitabine/FU dose
+
+patientDataMerged$neoAdjuvantSN38<-ifelse(grepl("Irinotecan", patientDataMerged$NeoAdjuvant, fixed = TRUE) | 
+                                 grepl("FFX", patientDataMerged$NeoAdjuvant, fixed = TRUE), TRUE, FALSE)
+
+patientDataMerged$neoAdjuvantOX<-ifelse(grepl("Cis", patientDataMerged$NeoAdjuvant, fixed = TRUE) | 
+                                 grepl("FFX", patientDataMerged$NeoAdjuvant, fixed = TRUE), TRUE, FALSE)
+
+patientDataMerged$neoAdjuvantGEM<-ifelse(grepl("GA", patientDataMerged$NeoAdjuvant, fixed = TRUE) | 
+                                 grepl("Gem", patientDataMerged$NeoAdjuvant, fixed = TRUE), TRUE, FALSE)
+
+patientDataMerged$neoAdjuvantPAC<-ifelse(grepl("GA", patientDataMerged$NeoAdjuvant, fixed = TRUE) | 
+                                 grepl("Abraxane", patientDataMerged$NeoAdjuvant, fixed = TRUE), TRUE, FALSE)
+
+
+
+```
+
+```{r pharmacotype processing}
+
+#create ranks for IC50 values for other analysis
+patientDataMerged$IC50.FU.rank <- rank(patientDataMerged$IC50.FU)
+patientDataMerged$IC50.SN38.rank <- rank(patientDataMerged$IC50.SN38)
+patientDataMerged$IC50.OX.rank <- rank(patientDataMerged$IC50.OX)
+patientDataMerged$IC50.GEM.rank <- rank(patientDataMerged$IC50.GEM)
+patientDataMerged$IC50.PAC.rank <- rank(patientDataMerged$IC50.PAC)
+
+## for pre-treated organoids, did the organoid see each drug before resection
+# then perform pharmacotype bucketing per each category
+# at some point will clean this up with a big for loop to cycle through the drugs instead of paste the same code 5 times
+
+patientDataMerged$organoidGotFU <- ifelse(!patientDataMerged$Organoid.treatment.naive,
+                                          ifelse(patientDataMerged$neoAdjuvantFU, 
+                                                 "Organoid treated with FU",
+                                                 "Organoid treated with other") , 
+                                          "Organoid untreated")
+patientDataMerged$organoidGotFU <- factor(patientDataMerged$organoidGotFU, levels = 
+                                            c("Organoid treated with FU",
+                                              "Organoid treated with other",
+                                              "Organoid untreated"))
+patientDataMerged$FU.pharmacotype.level<-NA
+for (j in levels(patientDataMerged$organoidGotFU)) {
+patientDataMerged[patientDataMerged$organoidGotFU %in% j,]$FU.pharmacotype.level<-cut(patientDataMerged[patientDataMerged$organoidGotFU %in% j,]$IC50.FU, breaks = quantile(patientDataMerged[patientDataMerged$organoidGotFU %in% j,]$IC50.FU, probs = seq (0, 1, 1/3), na.rm=TRUE), include.lowest = TRUE, right=FALSE)
+}
+patientDataMerged$FU.pharmacotype.level<- 4-patientDataMerged$FU.pharmacotype.level
+patientDataMerged$FU.pharmacotype.level<-factor( patientDataMerged$FU.pharmacotype.level, labels = c("Resistant", "Intermediate", "Sensitive"))
+
+patientDataMerged$organoidGotSN38 <- ifelse(!patientDataMerged$Organoid.treatment.naive,
+                                          ifelse(patientDataMerged$neoAdjuvantSN38, 
+                                                 "Organoid treated with SN38",
+                                                 "Organoid treated with other") , 
+                                          "Organoid untreated")
+patientDataMerged$organoidGotSN38 <- factor(patientDataMerged$organoidGotSN38, levels = 
+                                            c("Organoid treated with SN38",
+                                              "Organoid treated with other",
+                                              "Organoid untreated"))
+patientDataMerged$SN38.pharmacotype.level<-NA
+for (j in levels(patientDataMerged$organoidGotSN38)) {
+patientDataMerged[patientDataMerged$organoidGotSN38 %in% j,]$SN38.pharmacotype.level<-cut(patientDataMerged[patientDataMerged$organoidGotSN38 %in% j,]$IC50.SN38, breaks = quantile(patientDataMerged[patientDataMerged$organoidGotSN38 %in% j,]$IC50.SN38, probs = seq (0, 1, 1/3), na.rm=TRUE), include.lowest = TRUE, right=FALSE)
+}
+patientDataMerged$SN38.pharmacotype.level<- 4-patientDataMerged$SN38.pharmacotype.level
+patientDataMerged$SN38.pharmacotype.level<-factor( patientDataMerged$SN38.pharmacotype.level, labels = c("Resistant", "Intermediate", "Sensitive"))
+
+patientDataMerged$organoidGotOX <- ifelse(!patientDataMerged$Organoid.treatment.naive,
+                                          ifelse(patientDataMerged$neoAdjuvantOX, 
+                                                 "Organoid treated with OX",
+                                                 "Organoid treated with other") , 
+                                          "Organoid untreated")
+patientDataMerged$organoidGotOX <- factor(patientDataMerged$organoidGotOX, levels = 
+                                            c("Organoid treated with OX",
+                                              "Organoid treated with other",
+                                              "Organoid untreated"))
+patientDataMerged$OX.pharmacotype.level<-NA
+for (j in levels(patientDataMerged$organoidGotOX)) {
+patientDataMerged[patientDataMerged$organoidGotOX %in% j,]$OX.pharmacotype.level<-cut(patientDataMerged[patientDataMerged$organoidGotOX %in% j,]$IC50.OX, breaks = quantile(patientDataMerged[patientDataMerged$organoidGotOX %in% j,]$IC50.OX, probs = seq (0, 1, 1/3), na.rm=TRUE), include.lowest = TRUE, right=FALSE)
+}
+patientDataMerged$OX.pharmacotype.level<- 4-patientDataMerged$OX.pharmacotype.level
+patientDataMerged$OX.pharmacotype.level<-factor( patientDataMerged$OX.pharmacotype.level, labels = c("Resistant", "Intermediate", "Sensitive"))
+
+patientDataMerged$organoidGotGEM <- ifelse(!patientDataMerged$Organoid.treatment.naive,
+                                          ifelse(patientDataMerged$neoAdjuvantGEM, 
+                                                 "Organoid treated with GEM",
+                                                 "Organoid treated with other") , 
+                                          "Organoid untreated")
+patientDataMerged$organoidGotGEM <- factor(patientDataMerged$organoidGotGEM, levels = 
+                                            c("Organoid treated with GEM",
+                                              "Organoid treated with other",
+                                              "Organoid untreated"))
+patientDataMerged$GEM.pharmacotype.level<-NA
+for (j in levels(patientDataMerged$organoidGotGEM)) {
+patientDataMerged[patientDataMerged$organoidGotGEM %in% j,]$GEM.pharmacotype.level<-cut(patientDataMerged[patientDataMerged$organoidGotGEM %in% j,]$IC50.GEM, breaks = quantile(patientDataMerged[patientDataMerged$organoidGotGEM %in% j,]$IC50.GEM, probs = seq (0, 1, 1/3), na.rm=TRUE), include.lowest = TRUE, right=FALSE)
+}
+patientDataMerged$GEM.pharmacotype.level<- 4-patientDataMerged$GEM.pharmacotype.level
+patientDataMerged$GEM.pharmacotype.level<-factor( patientDataMerged$GEM.pharmacotype.level, labels = c("Resistant", "Intermediate", "Sensitive"))
+
+patientDataMerged$organoidGotPAC <- ifelse(!patientDataMerged$Organoid.treatment.naive,
+                                          ifelse(patientDataMerged$neoAdjuvantPAC, 
+                                                 "Organoid treated with PAC",
+                                                 "Organoid treated with other") , 
+                                          "Organoid untreated")
+patientDataMerged$organoidGotPAC <- factor(patientDataMerged$organoidGotPAC, levels = 
+                                            c("Organoid treated with PAC",
+                                              "Organoid treated with other",
+                                              "Organoid untreated"))
+patientDataMerged$PAC.pharmacotype.level<-NA
+for (j in levels(patientDataMerged$organoidGotPAC)) {
+patientDataMerged[patientDataMerged$organoidGotPAC %in% j,]$PAC.pharmacotype.level<-cut(patientDataMerged[patientDataMerged$organoidGotPAC %in% j,]$IC50.PAC, breaks = quantile(patientDataMerged[patientDataMerged$organoidGotPAC %in% j,]$IC50.PAC, probs = seq (0, 1, 1/3), na.rm=TRUE), include.lowest = TRUE, right=FALSE)
+}
+patientDataMerged$PAC.pharmacotype.level<- 4-patientDataMerged$PAC.pharmacotype.level
+patientDataMerged$PAC.pharmacotype.level<-factor( patientDataMerged$PAC.pharmacotype.level, labels = c("Resistant", "Intermediate", "Sensitive"))
+
+rm(j)
+
+### pharmacotype is potentially affected by pre-treatment with the drug in question 
+## (not statistically significant though for medians by Kruskal-Wallis or distribution by Kolgorov-Smirnov)
+
+SupFig1A <- ggplot(data=patientDataMerged, mapping = aes(x = organoidGotFU, y = IC50.FU.rank)) +
+         geom_boxplot() + geom_jitter(aes(shape=Is.biopsy, color = FU.pharmacotype.level), width = 0.1, height = 0) + scale_color_manual(values=c("#FFEA46FF", "#7C7B78FF" , "#00204DFF")) + stat_compare_means() + labs(color = "Sensitivity level", x = "Organoid pre-treatment status", y = "Rank of IC50 for 5-FU", shape = "Organoid established from biopsy")+ theme_minimal() + theme(axis.text.x=element_text(angle = -15, hjust = 0)) 
+ks.test(patientDataMerged[patientDataMerged$organoidGotFU %in% "Organoid untreated",]$IC50.FU.rank, patientDataMerged[patientDataMerged$organoidGotFU %in% "Organoid treated with FU",]$IC50.FU.rank)
+
+
+SupFig1B <- ggplot(data=patientDataMerged, mapping = aes(x = organoidGotSN38, y = IC50.SN38.rank)) +
+         geom_boxplot() + geom_jitter(aes(shape=Is.biopsy, color = SN38.pharmacotype.level), width = 0.1, height = 0) + scale_color_manual(values=c("#FFEA46FF", "#7C7B78FF" , "#00204DFF" )) + stat_compare_means() + labs(color = "Sensitivity level", x = "Organoid pre-treatment status", y = "Rank of IC50 for SN38", shape = "Organoid established from biopsy")+ theme_minimal() + theme(axis.text.x=element_text(angle = -15, hjust = 0))
+ks.test(patientDataMerged[patientDataMerged$organoidGotSN38 %in% "Organoid untreated",]$IC50.SN38.rank, patientDataMerged[patientDataMerged$organoidGotSN38 %in% "Organoid treated with SN38",]$IC50.SN38.rank)
+
+
+SupFig1C <- ggplot(data=patientDataMerged, mapping = aes(x = organoidGotOX, y = IC50.OX.rank)) +
+         geom_boxplot() + geom_jitter(aes(shape=Is.biopsy, color = OX.pharmacotype.level), width = 0.1, height = 0) + scale_color_manual(values=c("#FFEA46FF", "#7C7B78FF" , "#00204DFF")) + stat_compare_means() + labs(color = "Sensitivity level", x = "Organoid pre-treatment status", y = "Rank of IC50 for oxaliplatin", shape = "Organoid established from biopsy") + theme_minimal() + theme(axis.text.x=element_text(angle = -15, hjust = 0))
+ks.test(patientDataMerged[patientDataMerged$organoidGotOX %in% "Organoid untreated",]$IC50.OX.rank, patientDataMerged[patientDataMerged$organoidGotOX %in% "Organoid treated with OX",]$IC50.OX.rank)
+
+SupFig1D <- ggplot(data=patientDataMerged, mapping = aes(x = organoidGotGEM, y = IC50.GEM.rank)) +         geom_boxplot() + geom_jitter(aes(shape=Is.biopsy, color = GEM.pharmacotype.level), width = 0.1, height = 0) + scale_color_manual(values=c("#FFEA46FF", "#7C7B78FF" , "#00204DFF")) + stat_compare_means() + labs(color = "Sensitivity level", x = "Organoid pre-treatment status", y = "Rank of IC50 for gemcitabine", shape = "Organoid established from biopsy") + theme_minimal() + theme(axis.text.x=element_text(angle = -15, hjust = 0))
+ks.test(patientDataMerged[patientDataMerged$organoidGotGEM %in% "Organoid untreated",]$IC50.GEM.rank, patientDataMerged[patientDataMerged$organoidGotGEM %in% "Organoid treated with GEM",]$IC50.GEM.rank)
+
+SupFig1E <- ggplot(data=patientDataMerged, mapping = aes(x = organoidGotPAC, y = IC50.PAC.rank)) +
+         geom_boxplot() + geom_jitter(aes(shape=Is.biopsy, color = PAC.pharmacotype.level), width = 0.1, height = 0) + scale_color_manual(values=c("#FFEA46FF", "#7C7B78FF" , "#00204DFF")) + stat_compare_means() + labs(color = "Sensitivity level", x = "Organoid pre-treatment status", y = "Rank of IC50 for paclitaxel", shape = "Organoid established from biopsy") + theme_minimal() + theme(axis.text.x=element_text(angle = -15, hjust = 0))
+ks.test(patientDataMerged[patientDataMerged$organoidGotPAC %in% "Organoid untreated",]$IC50.PAC.rank, patientDataMerged[patientDataMerged$organoidGotPAC %in% "Organoid treated with PAC",]$IC50.PAC.rank)
+
+
+##pharmacotyping match algorithm results for Fig 2B
+pharmacotypedCasesInVitro <- patientDataMerged[,c(grep(pattern = ".pharmacotype.level", x = colnames(patientDataMerged), value=TRUE, fixed=TRUE),"PDO.line.name")]
+colnames(pharmacotypedCasesInVitro) <- c(sub(x = colnames(pharmacotypedCasesInVitro)[1:5], pattern = ".pharmacotype.level", replacement = ""),"case.ID")
+pharmacotypedCasesInVitro <- pharmacotypedCasesInVitro[do.call(order, args = c(pharmacotypedCasesInVitro, decreasing=TRUE)),]
+
+
+inVitroPharmacotypeMatchResults <- regimenMatch(pharmacotypedCases = pharmacotypedCasesInVitro, preferredRegimens = c(NCCNRegimens, alternateRegimens), prohibitedRegimens = c("FU-SN38-OX-GEM", "FU-SN38-OX-PAC", "FU-SN38-GEM-PAC", "FU-OX-GEM-PAC", "SN38-OX-GEM-PAC", "FU-SN38-OX-GEM-PAC"), usePermutedCombos = FALSE)
+
+Fig2B <- inVitroPharmacotypeMatchResults$heatmapFigure
+
+patientDataMerged <- merge(patientDataMerged, inVitroPharmacotypeMatchResults[["matchedCases"]][,c("matchedRegimen","matchedWellMatched","case.ID")],
+                           by.x = "PDO.line.name", by.y = "case.ID", sort = FALSE)
+
+
+#make character string of pharmacotype to summarize
+patientDataMerged$pharmacotypeKey <- paste0(patientDataMerged$FU.pharmacotype.level, patientDataMerged$SN38.pharmacotype.level, patientDataMerged$OX.pharmacotype.level, patientDataMerged$GEM.pharmacotype.level, patientDataMerged$PAC.pharmacotype.level)
+patientDataMerged$pharmacotypeKey <- gsub("ensitive","", patientDataMerged$pharmacotypeKey)
+patientDataMerged$pharmacotypeKey <- gsub("ntermediate","", patientDataMerged$pharmacotypeKey)
+patientDataMerged$pharmacotypeKey <- gsub("esistant","", patientDataMerged$pharmacotypeKey)
+
+
+
+#coding neoadjuvant regimens
+patientDataMerged$neoAdjuvantRegimen<-paste0( 
+  ifelse(patientDataMerged$neoAdjuvantFU,"FU.",""),
+  ifelse(patientDataMerged$neoAdjuvantSN38,"SN38.",""),
+  ifelse(patientDataMerged$neoAdjuvantOX,"OX.",""),
+  ifelse(patientDataMerged$neoAdjuvantGEM,"GEM.",""),
+  ifelse(patientDataMerged$neoAdjuvantPAC,"PAC.","")
+  )
+
+#count how many drugs in regimen
+patientDataMerged$countOfNeoAdjuvantDrugs <- nchar(patientDataMerged$neoAdjuvantRegimen) - nchar(gsub(".","", patientDataMerged$neoAdjuvantRegimen, fixed=TRUE ) )
+
+# summarize to established categories
+# note will drop non-standard regimens so this was done after examining actual regimen data to be sure I wasn't dropping real but unusual regimens
+# drops all FFX_GA combined cases for now since ambiguous what they actually got
+patientDataMerged$simpleNeoAdjuvantRegimen <- NA
+patientDataMerged[patientDataMerged$neoAdjuvantRegimen %in% "",]$simpleNeoAdjuvantRegimen <- "None"
+patientDataMerged[patientDataMerged$neoAdjuvantRegimen %in% "FU.SN38.OX.",]$simpleNeoAdjuvantRegimen <- "FFX"
+patientDataMerged[patientDataMerged$neoAdjuvantRegimen %in% "GEM.PAC.",]$simpleNeoAdjuvantRegimen <- "GnP"
+patientDataMerged[patientDataMerged$neoAdjuvantRegimen %in% "FU.SN38.OX.GEM.PAC.",]$simpleNeoAdjuvantRegimen <- "FFX+GnP"
+
+
+#compute distance between regimen they got and their organoid pharmacotype
+patientDataMerged$distanceToNeoAdjuvantRegimen <- NA
+for (j in 1:length(rownames(patientDataMerged))){
+  if (patientDataMerged[j, "simpleNeoAdjuvantRegimen"] %in% "None") next
+  keyForRegimenTheyGot <- c(patientDataMerged[j,"neoAdjuvantFU"],
+                            patientDataMerged[j,"neoAdjuvantSN38"],
+                            patientDataMerged[j,"neoAdjuvantOX"],
+                            patientDataMerged[j,"neoAdjuvantGEM"],
+                            patientDataMerged[j,"neoAdjuvantPAC"])
+  
+  
+  pharmacotype <- patientDataMerged[j,grep("pharmacotype.level",colnames(patientDataMerged), value=TRUE, fixed=TRUE)]
+  
+  #this will zero out the distance for anything they didn't get, so we only compare within the space of what they actually got, in contrast to the matching algorithm above where we compare everything in 5D every time to compute match
+  patientDataMerged[j,"distanceToNeoAdjuvantRegimen"] <- 
+        as.numeric(dist(rbind(
+          as.numeric(pharmacotype[keyForRegimenTheyGot])-1, 
+          as.numeric(c(2,2,2,2,2)[keyForRegimenTheyGot])), 
+          method = "manhattan"))
+}
+rm(j, keyForRegimenTheyGot, pharmacotype)
+
+#cutoff of Well-matched to Poorly-matched - distance should be better than distance of "intermediate to everything" pharmacotype would be for that regimen
+patientDataMerged$neoAdjuvantWellMatched <- ifelse(patientDataMerged$distanceToNeoAdjuvantRegimen < patientDataMerged$countOfNeoAdjuvantDrugs, "Well-matched", "Poorly-matched")
+
+patientDataMerged[patientDataMerged$simpleNeoAdjuvantRegimen %in% c("None", NA, "FFX+GnP"),]$neoAdjuvantWellMatched <- NA
+
+
+
+#coding adjuvant regimens - same approach as above for neoadjuvant so not repeating internal comments
+patientDataMerged$adjuvantRegimen<-paste0( 
+  ifelse(patientDataMerged$adjuvantFU,"FU.",""),
+  ifelse(patientDataMerged$adjuvantSN38,"SN38.",""),
+  ifelse(patientDataMerged$adjuvantOX,"OX.",""),
+  ifelse(patientDataMerged$adjuvantGEM,"GEM.",""),
+  ifelse(patientDataMerged$adjuvantPAC,"PAC.","")
+  )
+
+patientDataMerged$countOfadjuvantDrugs <- nchar(patientDataMerged$adjuvantRegimen) - nchar(gsub(".","", patientDataMerged$adjuvantRegimen, fixed=TRUE ) )
+
+#note I allowed a few other regimens here because there was more real variety in adjuvant regimens
+#(ie gem-cap, FU or GEM monotherapy, etc)
+patientDataMerged$simpleadjuvantRegimen <- patientDataMerged$adjuvantRegimen
+patientDataMerged[patientDataMerged$adjuvantRegimen %in% "",]$simpleadjuvantRegimen <- "None"
+patientDataMerged[patientDataMerged$adjuvantRegimen %in% "FU.SN38.OX.",]$simpleadjuvantRegimen <- "FFX"
+patientDataMerged[patientDataMerged$adjuvantRegimen %in% "GEM.PAC.",]$simpleadjuvantRegimen <- "GnP"
+patientDataMerged[patientDataMerged$adjuvantRegimen %in% "FU.GEM.",]$simpleadjuvantRegimen <- "GemCap"
+patientDataMerged[patientDataMerged$adjuvantRegimen %in% "FU.SN38.OX.GEM.PAC.",]$simpleadjuvantRegimen <- "FFX+GnP"
+
+
+patientDataMerged$distanceToadjuvantRegimen <- NA
+for (j in 1:length(rownames(patientDataMerged))){
+  if (patientDataMerged[j, "simpleadjuvantRegimen"] %in% "None") next
+  keyForRegimenTheyGot <- c(patientDataMerged[j,"adjuvantFU"],
+                            patientDataMerged[j,"adjuvantSN38"],
+                            patientDataMerged[j,"adjuvantOX"],
+                            patientDataMerged[j,"adjuvantGEM"],
+                            patientDataMerged[j,"adjuvantPAC"])
+  
+  
+  pharmacotype <- patientDataMerged[j,grep("pharmacotype.level",colnames(patientDataMerged), value=TRUE, fixed=TRUE)]
+  
+  patientDataMerged[j,"distanceToadjuvantRegimen"] <- 
+        as.numeric(dist(rbind(
+          as.numeric(pharmacotype[keyForRegimenTheyGot])-1, 
+          as.numeric(c(2,2,2,2,2)[keyForRegimenTheyGot])), 
+          method = "manhattan"))
+}
+rm(j, keyForRegimenTheyGot, pharmacotype)
+
+patientDataMerged$adjuvantWellMatched <- ifelse(patientDataMerged$distanceToadjuvantRegimen < patientDataMerged$countOfadjuvantDrugs, "Well-matched", "Poorly-matched")
+
+patientDataMerged[patientDataMerged$simpleadjuvantRegimen %in% c("None", NA, "FFX+GnP"),]$adjuvantWellMatched <- NA
+
+#define cohort of patients who got neoadjuvant and adjuvant, or neither, and how they were matched
+patientDataMerged$bothMatched <- "Other"
+patientDataMerged[patientDataMerged$neoAdjuvantWellMatched %in% "Well-matched" &
+                    patientDataMerged$adjuvantWellMatched %in% "Well-matched",
+                  ]$bothMatched <- "Well-matched neoadjuvant and adjuvant"
+
+
+
+patientDataMerged[patientDataMerged$neoAdjuvantWellMatched %in% "Poorly-matched" & patientDataMerged$adjuvantWellMatched %in% "Poorly-matched",]$bothMatched <- "Poorly-matched neoadjuvant and adjuvant"
+
+patientDataMerged[is.na(patientDataMerged$simpleNeoAdjuvantRegimen) | is.na(patientDataMerged$simpleadjuvantRegimen),
+                  ]$bothMatched <- "NA regimen"
+
+patientDataMerged[patientDataMerged$simpleNeoAdjuvantRegimen %in% "None" &  patientDataMerged$simpleadjuvantRegimen %in% "None",
+                  ]$bothMatched <- "No neoadjuvant or adjuvant therapy"
+
+patientDataMerged[(patientDataMerged$neoAdjuvantWellMatched %in% "Well-matched" & patientDataMerged$adjuvantWellMatched %in% "Poorly-matched") | (patientDataMerged$neoAdjuvantWellMatched %in% "Poorly-matched" & patientDataMerged$adjuvantWellMatched %in% "Well-matched"),
+                  ]$bothMatched <- "Got both neoadjuvant and adjuvant, discordant match"
+
+
+patientDataMerged[patientDataMerged$neoAdjuvantWellMatched %in% "Well-matched" & is.na(patientDataMerged$adjuvantWellMatched) ,
+                  ]$bothMatched <- "Only got neoadjuvant, Well-matched"
+
+patientDataMerged[patientDataMerged$neoAdjuvantWellMatched %in% "Poorly-matched" & is.na(patientDataMerged$adjuvantWellMatched) ,
+                  ]$bothMatched <- "Only got neoadjuvant, Poorly-matched"
+
+patientDataMerged[patientDataMerged$adjuvantWellMatched %in% "Well-matched" & is.na(patientDataMerged$neoAdjuvantWellMatched) ,
+                  ]$bothMatched <- "Only got adjuvant, Well-matched"
+
+patientDataMerged[patientDataMerged$adjuvantWellMatched %in% "Poorly-matched" & is.na(patientDataMerged$neoAdjuvantWellMatched) ,
+                  ]$bothMatched <- "Only got adjuvant, Poorly-matched"
+
+
+# bucket matches for combined approach
+
+patientDataMerged$combinedMatched <- NA
+patientDataMerged[patientDataMerged$bothMatched %in% c("Only got adjuvant, Well-matched", "Only got neoadjuvant, Well-matched", "Well-matched neoadjuvant and adjuvant"),]$combinedMatched <- "Well-matched"
+
+patientDataMerged[patientDataMerged$bothMatched %in% c("Only got adjuvant, Poorly-matched", "Only got neoadjuvant, Poorly-matched", "Poorly-matched neoadjuvant and adjuvant"),]$combinedMatched <- "Poorly-matched"
+
+
+patientDataMerged[patientDataMerged$bothMatched %in% c("No neoadjuvant or adjuvant therapy"),]$combinedMatched <- "Never got chemotherapy"
+
+
+patientDataMerged$neoadjuvantRadiation <- grepl("RAD", x = patientDataMerged$NeoAdjuvant.Type, fixed = TRUE)
+
+patientDataMerged$cyclesNeoadjuvant1L <- floor(as.numeric(patientDataMerged$Total.Neoadjuvant.Cycles.Chemotherapy.Given))
+
+patientDataMerged$cyclesAdjuvant1L <- floor(as.numeric(patientDataMerged$Total.Adjuvant.Cycles.Chemotherapy.Given))
+
+patientDataMerged$cyclesChemoTotal1L <- patientDataMerged$cyclesAdjuvant1L + patientDataMerged$cyclesNeoadjuvant1L
+
+
+
+```
+
+
+Figures, Text Data, and Table Plots/Code
+
+```{r manuscript-figures-and-tables}
+library(knitr)
+
+
+kable(table(patientDataMerged$Clinical.Trial, patientDataMerged$simpleNeoAdjuvantRegimen, useNA="ifany"))
+
+#SupTable1
+list(NCCNRegimens, alternateRegimens)
+
+##Table 1 data
+kable(table(patientDataMerged$Is.PDAC , useNA = "ifany"))
+kable(table(patientDataMerged$Is.primary.tumor , useNA = "ifany"))
+kable(table(patientDataMerged$Is.biopsy , useNA = "ifany"))
+kable(table(patientDataMerged$Organoid.treatment.naive , useNA = "ifany"))
+kable(table(patientDataMerged$Clinical.Trial , useNA = "ifany"))
+kable(table(patientDataMerged$Clinical.Anatomic.Stage , useNA = "ifany"))
+kable(table(patientDataMerged$simpleNeoAdjuvantRegimen , useNA = "ifany"))
+kable(table(patientDataMerged$simpleadjuvantRegimen , useNA = "ifany"))
+
+ggarrange(SupFig1A, SupFig1B, SupFig1C, SupFig1D, SupFig1E, labels="AUTO", ncol = 1)
+
+ggsave("SupFig1.eps", device = cairo_ps, width = 7, height = 25, units = "in")
+
+## sidebar: make custom functions to call within corrgram to add significance stars to plot and draw least squares lines on scatter plots
+panel.cor.with.pstars <- function (x, y, corr = NULL, col.regions, cor.method, digits = 2, 
+  cex.cor, ...) 
+{
+  ncol <- 14
+  pal <- col.regions(ncol)
+  
+  auto <- missing(cex.cor)
+  usr <- par("usr")
+  on.exit(par(usr))
+  par(usr = c(0, 1, 0, 1))
+  if (!is.null(corr)) {
+    est <- corr
+    absest <- formatC(abs(est), digits = digits, format = "f")
+    est <- formatC(est, digits = digits, format = "f")
+    if (auto) 
+      cex.cor <- 0.5/strwidth(absest)
+        
+      col.ind <- as.numeric(cut(as.numeric(est), breaks = seq(from = -1, 
+    to = 1, length.out = ncol + 1), include.lowest = TRUE))
+      
+      text(0.5, 0.75, est, cex = cex.cor, col=pal[col.ind])
+  }
+  else {
+    if (sum(complete.cases(x, y)) < 4) {
+      warning("Need at least 4 complete cases for cor.test()")
+    }
+    else {
+      results <- cor.test(x, y, alternative = "two.sided", 
+        method = cor.method)
+      est <- results$estimate
+      absest <- formatC(abs(est), digits = digits, format = "f")
+      est <- formatC(est, digits = digits, format = "f")
+
+      if (auto) {cex.cor <- 0.5/strwidth(absest)}
+      
+      col.ind <- as.numeric(cut(as.numeric(est), breaks = seq(
+        from = -1, to = 1, length.out = ncol + 1), include.lowest = TRUE))
+      
+      text(0.5, 0.75, est, cex = cex.cor, col = pal[col.ind])
+      pstar <- results$p.value
+      pstar <- cut(pstar, breaks = c(0, 0.001, 0.01, 0.05, 1), labels = c("***", "**", "*", "NS"), include.lowest = TRUE, right = FALSE)
+      text(0.5, 0.22, pstar, cex = cex.cor/2, col= pal[col.ind])
+    }
+  }
+}
+
+panel.pts.with.line <- function (x, y, corr = NULL, col.regions, cor.method, ...) 
+{
+  if (!is.null(corr)) 
+    return()
+  plot.xy(xy.coords(x, y), type = "p", ...)
+  box(col = "lightgray")
+  abline(stats::lm(y~x), 
+      col = "grey45", ...)
+}
+
+#Figure 1
+cairo_ps("Fig1.eps")
+corrgram(patientDataMerged[,grepl("rank",colnames(patientDataMerged))], cor.method = "spearman", lower.panel = "panel.cor.with.pstars", pch = 20, col.regions = colorRampPalette(c("red", "salmon", "white", "royalblue", "navy")),   upper.panel = "panel.pts.with.line", labels = c("FU", "SN38", "OX", "GEM", "PAC"))
+dev.off()
+
+#Figure 2
+
+ggarrange(grid.grabExpr(draw(Fig2A, width = unit(7, "in"), height = unit(10, "in"))), grid.grabExpr(draw(Fig2B, width = unit(7, "in"), height = unit(6, "in"))), labels="AUTO", ncol = 2, align = "v")
+
+ggsave("Fig2.eps", device = cairo_ps, width = 14, height = 11, units = "in")
+
+
+kable(SimPharmacotypeMatchResults$matchFrequencies)
+
+kable(inVitroPharmacotypeMatchResults$matchFrequencies)
+
+#text data for "salvaging" mismatches
+
+kable(table( patientDataMerged$simpleNeoAdjuvantRegimen, patientDataMerged$neoAdjuvantWellMatched,  useNA = "ifany"))
+
+
+kable(table( patientDataMerged[patientDataMerged$simpleNeoAdjuvantRegimen %in% "FFX" & patientDataMerged$neoAdjuvantWellMatched %in% "Poorly-matched",]$matchedRegimen,  useNA = "ifany"))
+
+kable(table( patientDataMerged[patientDataMerged$simpleNeoAdjuvantRegimen %in% "FFX" & patientDataMerged$neoAdjuvantWellMatched %in% "Poorly-matched",]$matchedRegimen, patientDataMerged[patientDataMerged$simpleNeoAdjuvantRegimen %in% "FFX" & patientDataMerged$neoAdjuvantWellMatched %in% "Poorly-matched",]$matchedWellMatched, useNA = "ifany"))
+
+
+kable(table( patientDataMerged[patientDataMerged$simpleNeoAdjuvantRegimen %in% "GnP" & patientDataMerged$neoAdjuvantWellMatched %in% "Poorly-matched",]$matchedRegimen,  useNA = "ifany"))
+
+kable(table( patientDataMerged[patientDataMerged$simpleNeoAdjuvantRegimen %in% "GnP" & patientDataMerged$neoAdjuvantWellMatched %in% "Poorly-matched",]$matchedRegimen, patientDataMerged[patientDataMerged$simpleNeoAdjuvantRegimen %in% "GnP" & patientDataMerged$neoAdjuvantWellMatched %in% "Poorly-matched",]$matchedWellMatched,  useNA = "ifany"))
+
+
+## Figure 3
+
+Fig3A<- ggplot(data=patientDataMerged[!is.na(patientDataMerged$dichotomizedDeltaCA199byDidItNormalize) & !is.na(patientDataMerged$neoAdjuvantWellMatched),], mapping = aes(x=reorder(PDO.line.name, -relativeDeltaCA199IfEverAbnormal), y = relativeDeltaCA199IfEverAbnormal  )) + geom_col(aes(fill = neoAdjuvantWellMatched)) +  ggtitle("CA 19-9 response during neoadjuvant chemotherapy") + scale_fill_discrete(type=c("#AADC32FF", "#440154FF")) + theme_minimal() + theme(axis.title.x = element_blank(), panel.grid.major.x = element_blank(), axis.text.x = element_blank(), legend.position = c(0.8,0.8)) + labs(y = "Relative change in CA 19-9 from baseline", fill = "Neoadjuvant chemotherapy") + scale_y_continuous(labels = scales::percent)
+
+
+Desc(dichotomizedDeltaCA199byDidItNormalize ~ neoAdjuvantWellMatched, data = patientDataMerged, plotit = FALSE)
+
+
+Desc(relativeDeltaCA199IfEverAbnormal ~ neoAdjuvantWellMatched, data = patientDataMerged, plotit = FALSE)
+
+
+patientDataMerged$dichotomizedDeltaCA199byDidItNormalize <-
+  factor(patientDataMerged$dichotomizedDeltaCA199byDidItNormalize, 
+         levels = c("Remained or became elevated during neoadjuvant", "Became normal after neoadjuvant"))
+
+
+Fig3B <- ggplot(patientDataMerged[!is.na(patientDataMerged$dichotomizedDeltaCA199byDidItNormalize) & !is.na(patientDataMerged$neoAdjuvantWellMatched),] %>% group_by(neoAdjuvantWellMatched,dichotomizedDeltaCA199byDidItNormalize) %>%
+         dplyr::summarize(n = n()) %>%
+         mutate(pct=n/sum(n)),
+       aes(x= neoAdjuvantWellMatched, y = n, fill = dichotomizedDeltaCA199byDidItNormalize)) +
+  geom_bar(stat="identity") +
+  geom_text(aes(label=paste0(n, " (", sprintf("%1.1f", pct*100),"%)")), 
+            position=position_stack(vjust = 0.5)) + ggtitle ("CA 19-9 response during neoadjuvant chemotherapy") + scale_fill_discrete(type=c( "#FDE725FF", "#365D8DFF")) + theme_minimal() + theme(axis.title.y = element_blank(), axis.text.y = element_blank(), panel.grid.major = element_blank()) + labs(x = "Neoadjuvant chemotherapy", fill = "CA 19-9 outcome")
+
+ggarrange(Fig3A, Fig3B, ncol = 1, labels = "AUTO")
+ggsave("Fig3.eps", device = cairo_ps, width = 7, height = 9, units = "in")
+
+
+
+## Sup Figure 2
+
+SupFig2A<-ggplot(data=patientDataMerged[!is.na(patientDataMerged$imagingResponseRECIST) & !is.na(patientDataMerged$neoAdjuvantWellMatched),], mapping = aes(x=reorder(PDO.line.name, -imagingResponseRelative), y = imagingResponseRelative )) + geom_col(aes(fill = neoAdjuvantWellMatched)) +  ggtitle("Imaging response during neoadjuvant chemotherapy") + scale_fill_discrete(type=c("#AADC32FF", "#440154FF")) + theme_minimal() + theme(axis.title.x = element_blank(), panel.grid.major.x = element_blank(), axis.text.x = element_blank(), legend.position = c(0.8,0.8)) + labs(y = "Relative change in tumor diameter from baseline", fill = "Neoadjuvant chemotherapy") + scale_y_continuous(labels = scales::percent)
+
+Desc(imagingResponseRECIST ~ neoAdjuvantWellMatched, data = patientDataMerged, plotit = FALSE)
+
+
+Desc(imagingResponseRelative ~ neoAdjuvantWellMatched, data = patientDataMerged, plotit = FALSE)
+
+
+SupFig2B<-ggplot(patientDataMerged[!is.na(patientDataMerged$imagingResponseRECIST) & !is.na(patientDataMerged$neoAdjuvantWellMatched),] %>% group_by(neoAdjuvantWellMatched,imagingResponseRECIST) %>%
+         dplyr::summarize(n = n()) %>%
+         mutate(pct=n/sum(n)),
+       aes(x= neoAdjuvantWellMatched, y = n, fill = imagingResponseRECIST)) +
+  geom_bar(stat="identity") +
+  geom_text(aes(label=paste0(n, " (", sprintf("%1.1f", pct*100),"%)")), 
+            position=position_stack(vjust = 0.5)) + ggtitle ("Imaging response during neoadjuvant chemotherapy") + scale_fill_discrete(type=c("#FDE725FF","#365D8DFF"), labels = c("Imaging progression or minimal response", "Imaging response by 30% or more"))  + theme_minimal() + theme(axis.title.y = element_blank(), axis.text.y = element_blank()) + labs(fill = "Imaging response", x = "Neoadjuvant chemotherapy")
+
+
+ggarrange(SupFig2A, SupFig2B, ncol = 1, labels = "AUTO")
+
+ggsave("SupFig2.eps", device = cairo_ps, width = 7, height = 9, units = "in")
+
+
+##Figure 4
+patientDataMerged$neoAdjuvantWellMatchedOrNone <- patientDataMerged$neoAdjuvantWellMatched
+patientDataMerged[is.na(patientDataMerged$neoAdjuvantWellMatched),]$neoAdjuvantWellMatchedOrNone <- "No neoadjuvant"
+
+Desc(pN.status ~ neoAdjuvantWellMatchedOrNone, data = patientDataMerged, plotit=FALSE)
+
+Desc(pN.status ~ neoAdjuvantWellMatched, data = patientDataMerged, plotit=FALSE)
+
+
+ggplot(patientDataMerged[!is.na(patientDataMerged$pN.status),] %>% group_by(neoAdjuvantWellMatchedOrNone, pN.status) %>%
+         dplyr::summarize(n = n()) %>%
+         mutate(pct=n/sum(n)),
+       aes(x= neoAdjuvantWellMatchedOrNone, y = n, fill = pN.status)) +
+  geom_bar(stat="identity") +
+  geom_text(aes(label=paste0(n, " (", sprintf("%1.1f", pct*100),"%)")), 
+            position=position_stack(vjust = 0.5)) + ggtitle ("Lymph node status after neoadjuvant chemotherapy or surgery-first") + scale_fill_discrete(type=c("#FDE725FF","#365D8DFF")) + theme_minimal() + theme(axis.title.y = element_blank(), axis.text.y = element_blank(), panel.grid = element_blank()) + labs(fill = "Lymph node status", x = "Neoadjuvant chemotherapy")
+
+ggsave("Fig4.eps", device = cairo_ps, width = 7, height = 9, units = "in")
+
+
+#Figure 5
+
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ neoAdjuvantWellMatched , data = patientDataMerged)
+Fig5A <- ggsurvplot(fit, pval=F, pval.method = TRUE, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1461), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none", xlab = "Time (months)", ylab = "Recurrence-free survival", legend.labs = c("Poorly-matched","Well-matched"), title = "A. RFS after neoadjuvant chemotherapy") 
+kable(summary(fit)$table[,"median"]*12/365.25)
+
+fit <- survfit(Surv((OS.postop.time), OS.postop.endpoint) ~ neoAdjuvantWellMatched , data = patientDataMerged)
+Fig5B <- ggsurvplot(fit, pval=F, pval.method = TRUE, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1461), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none", xlab = "Time (months)", ylab = "Overall survival", legend.labs = c("Poorly-matched","Well-matched"), title = "B. Post-op OS after neoadjuvant chemotherapy") 
+kable(summary(fit)$table[,"median"]*12/365.25)
+
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ adjuvantWellMatched , data = patientDataMerged)
+Fig5C <- ggsurvplot(fit, pval=F, pval.method = TRUE, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1461), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none", xlab = "Time (months)", ylab = "Recurrence-free survival", legend.labs = c("Poorly-matched","Well-matched"), title = "C. RFS after adjuvant chemotherapy") 
+kable(summary(fit)$table[,"median"]*12/365.25)
+
+fit <- survfit(Surv((OS.postop.time), OS.postop.endpoint) ~ adjuvantWellMatched , data = patientDataMerged)
+Fig5D <- ggsurvplot(fit, pval=F, pval.method = TRUE, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1461), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none", xlab = "Time (months)", ylab = "Overall survival", legend.labs = c("Poorly-matched","Well-matched"), title = "D. Post-op OS after adjuvant chemotherapy") 
+kable(summary(fit)$table[,"median"]*12/365.25)
+
+cairo_ps("Fig5.eps", width = 14, height = 14)
+arrange_ggsurvplots(
+  list(Fig5A, Fig5C, Fig5B, Fig5D),
+  ncol = 2,
+  nrow = 2,
+  surv.plot.height = 0.75,
+  ncensor.plot.height = NULL
+)
+dev.off()
+
+
+#Fig 6
+kable(table(patientDataMerged$bothMatched, useNA="ifany"))
+
+patientDataMerged$bothMatchedFactor <- factor(patientDataMerged$bothMatched, levels = c("Poorly-matched neoadjuvant and adjuvant", "Well-matched neoadjuvant and adjuvant", "No neoadjuvant or adjuvant therapy"))
+                                        
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ bothMatchedFactor, data = patientDataMerged[patientDataMerged$bothMatched %in% c(
+  "No neoadjuvant or adjuvant therapy",
+  "Poorly-matched neoadjuvant and adjuvant",
+  "Well-matched neoadjuvant and adjuvant"
+  )
+  ,])
+Fig6A<-ggsurvplot(fit, pval=F, pval.method = TRUE, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1461), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none", xlab = "Time (months)", ylab = "Recurrence-free survival", risk.table.height = 0.3, title =  "A. RFS after neoadjuvant and adjuvant chemotherapy", legend.labs = c("Poorly-matched chemotherapy","Well-matched chemotherapy", "No chemotherapy")
+           )
+kable(summary(fit)$table[,"median"]*12/365.25)
+### p for RFS 0.62 none vs poor, 0.013 poor vs well
+
+fit <- survfit(Surv((OS.postop.time), OS.postop.endpoint) ~ bothMatchedFactor , data = patientDataMerged[patientDataMerged$bothMatched %in% c(
+  "No neoadjuvant or adjuvant therapy",
+  "Poorly-matched neoadjuvant and adjuvant",
+  "Well-matched neoadjuvant and adjuvant"
+  )
+  ,])
+
+Fig6B<-ggsurvplot(fit, pval=F, pval.method = TRUE, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1461), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none", xlab = "Time (months)", ylab = "Overall survival", legend.labs = c("Poorly-matched chemotherapy","Well-matched chemotherapy", "No chemotherapy"), 
+           risk.table.height = 0.3, title = "B. OS after neoadjuvant and adjuvant chemotherapy") 
+kable(summary(fit)$table[,"median"]*12/365.25)
+### p for OS 0.24 none vs poor, 0.03 poor vs well
+
+cairo_ps("Fig6.eps", width = 8, height = 11)
+arrange_ggsurvplots(
+  list(Fig6A, Fig6B),
+  ncol = 1,
+  nrow = 2,
+  surv.plot.height = 0.75,
+  ncensor.plot.height = NULL
+)
+dev.off()
+
+
+##Supplemental Tables 2 and 3
+
+table(patientDataMerged$simpleNeoAdjuvantRegimen, patientDataMerged$pN.status, useNA="ifany")
+
+
+table(patientDataMerged$neoadjuvantRadiation, patientDataMerged$pN.status, useNA="ifany")
+
+table( patientDataMerged$neoAdjuvantWellMatched, patientDataMerged$pN.status, 
+patientDataMerged$neoadjuvantRadiation , useNA="ifany")
+
+table( patientDataMerged$neoAdjuvantWellMatched, patientDataMerged$pN.status, patientDataMerged$simpleNeoAdjuvantRegimen , useNA="ifany")
+
+
+
+table(patientDataMerged$simpleNeoAdjuvantRegimen, patientDataMerged$pN.status, useNA="ifany")
+
+table(patientDataMerged$neoadjuvantRadiation, patientDataMerged$dichotomizedDeltaCA199byDidItNormalize, useNA="ifany")
+
+table(patientDataMerged$neoAdjuvantWellMatched, patientDataMerged$dichotomizedDeltaCA199byDidItNormalize, patientDataMerged$neoadjuvantRadiation, useNA="ifany")
+
+table(patientDataMerged$neoAdjuvantWellMatched, patientDataMerged$dichotomizedDeltaCA199byDidItNormalize, patientDataMerged$simpleNeoAdjuvantRegimen, useNA="ifany")
+
+
+
+
+```
+
+
+Other figures of interest, not for manuscript. Including points raised by co-authors during manuscript review.
+
+```{r random-extra-figures}
+
+table(patientDataMerged$combinedMatched, useNA="ifany")
+
+
+ggplot(data=patientDataMerged[!is.na(patientDataMerged$dichotomizedDeltaCA199byDidItNormalize) & !is.na(patientDataMerged$neoAdjuvantWellMatched),], mapping = aes(x=reorder(PDO.line.name, -relativeDeltaCA199IfEverAbnormal), y = relativeDeltaCA199IfEverAbnormal  )) + geom_col(aes(fill = simpleNeoAdjuvantRegimen)) +  ggtitle("CA 19-9 response during neoadjuvant chemotherapy") + theme_minimal() + theme(axis.title.x = element_blank(), panel.grid.major.x = element_blank(), axis.text.x = element_blank(), legend.position = c(0.8,0.8)) + labs(y = "Relative change in CA 19-9 from baseline", fill = "Neoadjuvant chemotherapy")
+
+
+ggplot(data=patientDataMerged[!is.na(patientDataMerged$dichotomizedDeltaCA199byDidItNormalize) & !is.na(patientDataMerged$neoAdjuvantWellMatched),], mapping = aes(x=reorder(PDO.line.name, -relativeDeltaCA199IfEverAbnormal), y = relativeDeltaCA199IfEverAbnormal  )) + geom_col(aes(fill = as.numeric(Total.Neoadjuvant.Cycles.Chemotherapy.Given) )) +  ggtitle("CA 19-9 response during neoadjuvant chemotherapy") + theme_minimal() + theme(axis.title.x = element_blank(), panel.grid.major.x = element_blank(), axis.text.x = element_blank(), legend.position = c(0.8,0.8)) + labs(y = "Relative change in CA 19-9 from baseline", fill = "Neoadjuvant chemotherapy")
+
+
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ combinedMatched , data = patientDataMerged)
+ggsurvplot(fit, pval=T, pval.method = TRUE, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1461), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none", xlab = "Time (months)", ylab = "Recurrence-free survival", title = "RFS after surgery") 
+
+
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ combinedMatched , data = patientDataMerged[patientDataMerged$cyclesChemoTotal1L>=8,])
+ggsurvplot(fit, pval=T, pval.method = TRUE, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1461), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none", xlab = "Time (months)", ylab = "Recurrence-free survival", title = "RFS after surgery, only those w at least 8 total cycles chemotherapy received") 
+
+
+
+table(patientDataMerged$cyclesNeoadjuvant1L, patientDataMerged$simpleNeoAdjuvantRegimen, useNA = "ifany")
+
+
+table(patientDataMerged$cyclesAdjuvant1L, patientDataMerged$simpleadjuvantRegimen, useNA = "ifany")
+
+
+hist(patientDataMerged$cyclesChemoTotal1L)
+
+
+#heatmaps with quality flags and some tables of quality results
+SimPharmacotypeMatchResults$heatmapFigureWithQualityFlag
+
+inVitroPharmacotypeMatchResults$heatmapFigureWithQualityFlag
+
+table(SimPharmacotypeMatchResults$matchedCases$matchedWellMatched, useNA = "ifany")
+
+table(inVitroPharmacotypeMatchResults$matchedCases$matchedWellMatched, useNA = "ifany")
+
+##scatterplot of various markers of neoadjuvant response
+ggplot(data=patientDataMerged[!is.na(patientDataMerged$imagingResponseRelative) & !is.na(patientDataMerged$relativeDeltaCA199IfEverAbnormal),], mapping = aes(x= imagingResponseRelative, y = relativeDeltaCA199IfEverAbnormal)) + geom_point(aes(color = distanceToNeoAdjuvantRegimen/(2*countOfNeoAdjuvantDrugs), shape = pN.status)) + scale_color_viridis() +  ggtitle("Scatter of neoadjuvant responses, all neoadjuvant cases") + theme_minimal() + scale_y_continuous(limits = c(-1,1))
+
+
+#comparisons of IC50 by tumor grade - all are 2/3 except occasional missing, NA, "undifferentiated"
+ggplot(data=patientDataMerged[patientDataMerged$Tumor.Grade %in% c("3","2"),], mapping = aes(x = Tumor.Grade, y = IC50.FU.rank)) + geom_boxplot() + geom_jitter(mapping = aes(col = FU.pharmacotype.level)) + stat_compare_means()
+
+ggplot(data=patientDataMerged[patientDataMerged$Tumor.Grade %in% c("3","2"),], mapping = aes(x = Tumor.Grade, y = IC50.SN38.rank)) + geom_boxplot() + geom_jitter(mapping = aes(col = SN38.pharmacotype.level)) + stat_compare_means()
+
+ggplot(data=patientDataMerged[patientDataMerged$Tumor.Grade %in% c("3","2"),], mapping = aes(x = Tumor.Grade, y = IC50.OX.rank)) + geom_boxplot() + geom_jitter(mapping = aes(col = OX.pharmacotype.level)) + stat_compare_means()
+
+ggplot(data=patientDataMerged[patientDataMerged$Tumor.Grade %in% c("3","2"),], mapping = aes(x = Tumor.Grade, y = IC50.GEM.rank)) + geom_boxplot() + geom_jitter(mapping = aes(col = GEM.pharmacotype.level)) + stat_compare_means()
+
+ggplot(data=patientDataMerged[patientDataMerged$Tumor.Grade %in% c("3","2"),], mapping = aes(x = Tumor.Grade, y = IC50.PAC.rank)) + geom_boxplot() + geom_jitter(mapping = aes(col = PAC.pharmacotype.level)) + stat_compare_means()
+
+
+#similar analysis for histology
+ggplot(data=patientDataMerged, mapping = aes(x = Tumor.Histology.type, y = IC50.FU.rank)) + geom_boxplot() + geom_jitter(mapping = aes(col = FU.pharmacotype.level)) + stat_compare_means()
+
+ggplot(data=patientDataMerged, mapping = aes(x = Tumor.Histology.type, y = IC50.SN38.rank)) + geom_boxplot() + geom_jitter(mapping = aes(col = SN38.pharmacotype.level)) + stat_compare_means()
+
+ggplot(data=patientDataMerged, mapping = aes(x = Tumor.Histology.type, y = IC50.OX.rank)) + geom_boxplot() + geom_jitter(mapping = aes(col = OX.pharmacotype.level)) + stat_compare_means()
+
+ggplot(data=patientDataMerged, mapping = aes(x = Tumor.Histology.type, y = IC50.GEM.rank)) + geom_boxplot() + geom_jitter(mapping = aes(col = GEM.pharmacotype.level)) + stat_compare_means()
+
+ggplot(data=patientDataMerged, mapping = aes(x = Tumor.Histology.type, y = IC50.PAC.rank)) + geom_boxplot() + geom_jitter(mapping = aes(col = PAC.pharmacotype.level)) + stat_compare_means()
+
+
+#adjuvant survival for surgery-first group
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ adjuvantWellMatched , data = patientDataMerged[patientDataMerged$simpleNeoAdjuvantRegimen %in% "None",])
+ggsurvplot(fit, pval=T, pval.method = TRUE, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1461), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none", xlab = "Time (months)", ylab = "Recurrence-free survival") +
+  ggtitle("RFS after adjuvant chemotherapy, surgery-first") 
+fit
+
+fit <- survfit(Surv((OS.postop.time), OS.postop.endpoint) ~ adjuvantWellMatched , data = patientDataMerged[patientDataMerged$simpleNeoAdjuvantRegimen %in% "None",])
+ggsurvplot(fit, pval=T, pval.method = TRUE, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1461), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none", xlab = "Time (months)", ylab = "Overall survival") +
+  ggtitle("OS after adjuvant chemotherapy, surgery-first") 
+fit
+
+## CA 19-9 response dichotomized, by scaled distance
+CochranArmitageTest(table( patientDataMerged[ !is.na(patientDataMerged$neoAdjuvantWellMatched),]$distanceToNeoAdjuvantRegimen/(2*patientDataMerged[ !is.na(patientDataMerged$neoAdjuvantWellMatched),]$countOfNeoAdjuvantDrugs), patientDataMerged[ !is.na(patientDataMerged$neoAdjuvantWellMatched),]$dichotomizedDeltaCA199byDidItNormalize, useNA="no" ))
+
+ggplot(data=patientDataMerged[!is.na(patientDataMerged$dichotomizedDeltaCA199byDidItNormalize) & !is.na(patientDataMerged$neoAdjuvantWellMatched),], aes(x = distanceToNeoAdjuvantRegimen/(2*countOfNeoAdjuvantDrugs))) + geom_bar(aes(fill = dichotomizedDeltaCA199byDidItNormalize)) + ggtitle ("CA 19-9 response during neoadjuvant chemotherapy (p = ***)") + scale_fill_discrete(type=c("#365D8DFF", "#FDE725FF"))
+
+
+## LN status, by scaled distance 
+CochranArmitageTest(table( patientDataMerged[ !is.na(patientDataMerged$neoAdjuvantWellMatched),]$distanceToNeoAdjuvantRegimen/(2*patientDataMerged[ !is.na(patientDataMerged$neoAdjuvantWellMatched),]$countOfNeoAdjuvantDrugs), patientDataMerged[ !is.na(patientDataMerged$neoAdjuvantWellMatched),]$pN.status, useNA="no" ))
+
+ggplot(data=patientDataMerged[!is.na(patientDataMerged$pN.status) & !is.na(patientDataMerged$neoAdjuvantWellMatched),], aes(x = distanceToNeoAdjuvantRegimen/(2*countOfNeoAdjuvantDrugs))) + geom_bar(aes(fill = pN.status)) + ggtitle ("LN status after neoadjuvant chemotherapy") + scale_fill_discrete(type=c( "#FDE725FF", "#365D8DFF"))
+
+
+##survival for clinical parameters
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ dichotomizedDeltaCA199byDidItNormalize, data = patientDataMerged[!patientDataMerged$simpleNeoAdjuvantRegimen %in% c("None", NA),])
+ggsurvplot(fit, pval=T, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1826.25), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none") + ggtitle("RFS by CA 19-9 normalization during neoadjuvant") 
+
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ imagingResponseRECIST, data = patientDataMerged[!patientDataMerged$simpleNeoAdjuvantRegimen %in% c("None", NA),])
+ggsurvplot(fit, pval=T, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1826.25), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none") + ggtitle("RFS by imaging during neoadjuvant") 
+
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ pN.status, data = patientDataMerged[!patientDataMerged$simpleNeoAdjuvantRegimen %in% c("None", NA),])
+ggsurvplot(fit, pval=T, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1826.25), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none") + ggtitle("RFS by N status after neoadjuvant") 
+
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ pN.status, data = patientDataMerged[patientDataMerged$simpleNeoAdjuvantRegimen %in% c("None"),])
+ggsurvplot(fit, pval=T, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1826.25), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none") + ggtitle("RFS by N status after surgery-first") 
+
+
+##survival for individual agents in neoadjuvant and adjuvant setting
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ FU.pharmacotype.level, data = patientDataMerged[patientDataMerged$neoAdjuvantFU,])
+ggsurvplot(fit, pval=T, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1826.25), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none") + ggtitle("RFS by FU sensitivity for patients who got neoadjuvant FU, all organoids") 
+
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ SN38.pharmacotype.level, data = patientDataMerged[patientDataMerged$neoAdjuvantSN38,])
+ggsurvplot(fit, pval=T, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1826.25), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none") +
+  ggtitle("RFS by SN38 sensitivity for patients who got neoadjuvant SN38, all organoids") 
+
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ OX.pharmacotype.level, data = patientDataMerged[patientDataMerged$neoAdjuvantOX,])
+ggsurvplot(fit, pval=T, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1826.25), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none") +
+  ggtitle("RFS by OX sensitivity for patients who got neoadjuvant OX, all organoids") 
+
+
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ GEM.pharmacotype.level, data = patientDataMerged[patientDataMerged$neoAdjuvantGEM,])
+ggsurvplot(fit, pval=T, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1826.25), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none") +
+  ggtitle("RFS by GEM sensitivity for patients who got neoadjuvant GEM, all organoids") 
+
+
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ PAC.pharmacotype.level, data = patientDataMerged[patientDataMerged$neoAdjuvantPAC,])
+ggsurvplot(fit, pval=T, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1826.25), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none") +
+  ggtitle("RFS by PAC sensitivity for patients who got neoadjuvant PAC, all organoids") 
+
+
+
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ FU.pharmacotype.level, data = patientDataMerged[patientDataMerged$adjuvantFU,])
+ggsurvplot(fit, pval=T, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1826.25), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none") + ggtitle("RFS by FU sensitivity for patients who got adjuvant FU, all organoids") 
+
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ SN38.pharmacotype.level, data = patientDataMerged[patientDataMerged$adjuvantSN38,])
+ggsurvplot(fit, pval=T, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1826.25), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none") +
+  ggtitle("RFS by SN38 sensitivity for patients who got adjuvant SN38, all organoids") 
+
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ OX.pharmacotype.level, data = patientDataMerged[patientDataMerged$adjuvantOX,])
+ggsurvplot(fit, pval=T, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1826.25), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none") +
+  ggtitle("RFS by OX sensitivity for patients who got adjuvant OX, all organoids") 
+
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ GEM.pharmacotype.level, data = patientDataMerged[patientDataMerged$adjuvantGEM,])
+ggsurvplot(fit, pval=T, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1826.25), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none") +
+  ggtitle("RFS by GEM sensitivity for patients who got adjuvant GEM, all organoids") 
+
+fit <- survfit(Surv((RFS.time), RFS.endpoint) ~ PAC.pharmacotype.level, data = patientDataMerged[patientDataMerged$adjuvantPAC,])
+ggsurvplot(fit, pval=T, risk.table = T, conf.int.style = "ribbon", conf.int.alpha = 0.2, surv.median.line = "hv", xscale = "d_m", xlim = c(0,1826.25), break.time.by = 365.25, palette = "jco", conf.int = TRUE, legend = "none") +
+  ggtitle("RFS by PAC sensitivity for patients who got adjuvant PAC, all organoids") 
+
+```
+
+```{r session-info}
+
+sessionInfo()
+
+
+```
